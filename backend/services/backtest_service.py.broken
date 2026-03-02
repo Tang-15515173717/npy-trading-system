@@ -1,0 +1,63 @@
+"""
+回测服务 - StockQuant Pro
+回测任务管理、启动、查询、删除。v2.1 支持因子组合双驱动回测；v2.3 支持打分驱动回测（日级、先卖后买、买卖优先级）。
+"""
+from typing import List, Dict, Optional, Any
+from datetime import datetime, timedelta
+from models.backtest import BacktestTask, BacktestTrade
+from models.strategy import Strategy
+from models.factor_combo import FactorCombo
+from models.bar_data import BarData
+from utils.database import db
+from utils.vnpy_wrapper import VnpyBacktestEngine
+import json
+
+
+def _trading_days_between(start_date: str, end_date: str) -> List[str]:
+    """生成 start_date 到 end_date 之间的日期列表（简化：按自然日，过滤周末）"""
+    start = datetime.strptime(start_date, "%Y%m%d")
+    end = datetime.strptime(end_date, "%Y%m%d")
+    days = []
+    d = start
+    while d <= end:
+        if d.weekday() < 5:  # 0-4 周一到周五
+            days.append(d.strftime("%Y%m%d"))
+        d += timedelta(days=1)
+    return days
+
+
+def _run_scoring_driven_backtest(
+    async_task,  # 🆕 异步任务对象，用于更新进度和检查停止标志
+    strategy_id: Optional[int],
+    strategy_name: Optional[str],
+    factor_combo_id: int,
+    factor_combo_name: str,
+    start_date: str,
+    end_date: str,
+    initial_capital: float,
+    commission: float,
+    params: Dict[str, Any],
+) -> Dict:
+    """
+    打分驱动回测（日级、先卖后买、买卖优先级与规格 4.2/4.3 一致）。
+    返回 result 字典（statistics, equity_curve, trades），并已写入 BacktestTrade。
+    🆕 v2.3.1: strategy_id 和 strategy_name 改为可选，支持纯因子打分回测模式
+    🆕 v2.3.2: 支持异步执行和停止功能
+    """
+    from services.factor_service import FactorService
+
+    try:
+        task_id = async_task.task_id if async_task else "unknown"
+
+        import sys
+        import logging
+
+        # 配置专门的回测日志文件
+        backtest_logger = logging.getLogger('backtest')
+        if not backtest_logger.handlers:
+            handler = logging.FileHandler('/tmp/backtest_execution.log')
+            handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+            backtest_logger.addHandler(handler)
+            backtest_logger.setLevel(logging.INFO)
+
+        # 确保输出能被看到（定义在try块外面，这样整个函数都能用）

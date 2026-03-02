@@ -41,3 +41,105 @@ _templates
 # Alpha
 lab/
 /.mypy_cache
+
+# ===== 以下是新增的忽略规则 =====
+
+# 所有文档
+*.md
+
+# 所有脚本
+*.sh
+
+# 前端和UI相关
+frontend/
+agent-dashboard/
+
+# 文档目录
+docs/
+
+# 数据和日志
+logs/
+data/
+database/
+
+# 虚拟环境
+venv/
+venv_backend/
+venv_x86/
+
+# 配置文件
+.claude/
+.claude_rules_strategy.md
+.cursor/
+.cursorrules
+.docker/
+.github/
+
+# Docker 相关
+Dockerfile
+Dockerfile.*
+
+# 临时文件
+*.log
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bak
+*.tmp
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 测试和覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 环境变量
+.env
+.env.*
+
+# 测试和调试脚本
+test_*.py
+check_*.py
+verify_*.py
+diagnose_*.py
+auto_*.py
+mock_*.py
+
+# 演示和示例脚本
+*_demo.py
+*_demo.ipynb
+*_realistic.py
+*_simple.py
+
+# 其他工具脚本
+download_*.py
+update_*.py
+delete_*.py
+resync_*.py
+run_*.py
+visual_*.py
+realtime_*.py
+backtest_*.py
+simple_*.py
+
+# 配置文件
+*.conf
+*.txt
+*.html
+
+# Jupyter notebook
+*.ipynb
+
+# 配置文件
+config_*.py
+
+# 工作区文件
+*.code-workspace
+
+# Docker 凭证
+docker-credential-*

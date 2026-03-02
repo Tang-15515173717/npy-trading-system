@@ -1,0 +1,603 @@
+"""
+每日模拟观测服务
+负责执行每日的选股、模拟交易、资金管理
+保持简单逻辑，不依赖复杂的执行引擎
+"""
+import os
+import json
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any
+from collections import defaultdict
+
+from flask import current_app
+from utils.database import db
+from models.daily_observer import (
+    DailyObserverStrategy,
+    DailyObserverRecord,
+    DailyObserverTrade
+)
+from models.factor_combo import FactorCombo
+from models.factor_data import FactorData
+from models.bar_data import BarData
+from models.stock import Stock
+
+logger = logging.getLogger(__name__)
+
+# 固定手续费
+COMMISSION_RATE = 0.0003  # 双边0.03%
+
+
+class DailyObserverService:
+    """每日模拟观测服务"""
+
+    def __init__(self):
+        self.tushare_token = os.getenv("TUSHARE_TOKEN")
+        if not self.tushare_token:
+            raise ValueError("TUSHARE_TOKEN 环境变量未设置")
+
+        # TuShare Pro 接口
+        import tushare as ts
+        self.ts = ts.pro_api(token=self.tushare_token)
+
+        # 初始化执行引擎（稍后在策略中配置，但目前���使用）
+        self.scoring_engine = None
+
+    def _get_stock_pool(self, strategy: DailyObserverStrategy) -> List[str]:
+        """获取股票池"""
+        if strategy.stock_pool:
+            return json.loads(strategy.stock_pool)
+        return []
+
+    def _has_factor_data(self, stocks: List[str], trade_date: str, min_ratio: float = 0.5) -> bool:
+        """检查是否有足够的因子数据"""
+        try:
+            count = FactorData.query.filter(
+                FactorData.ts_code.in_(stocks),
+                FactorData.trade_date == trade_date
+            ).count()
+            ratio = count / len(stocks) if stocks else 0
+            return ratio >= min_ratio
+        except Exception as e:
+            logger.debug(f"检查因子数据失败: {e}")
+            return False
+
+    def _calculate_scores(self, strategy: DailyObserverStrategy, stocks: List[str],
+                         trade_date: str) -> Dict[str, float]:
+        """计算所有股票的因子得分（Z-score标准化）"""
+        try:
+            # 获取因子组合配置
+            combo = FactorCombo.query.get(strategy.factor_combo_id)
+            if not combo:
+                logger.error(f"因子组合{strategy.factor_combo_id}不存在")
+                return {}
+
+            try:
+                factor_config = json.loads(combo.factor_config)
+                factors = factor_config.get("factors", [])
+            except Exception as e:
+                logger.error(f"解析因子组合配置失败: {e}")
+                return {}
+
+            if not factors:
+                logger.error("因子组合没有配置因子")
+                return {}
+
+            # 收集所有股票的因子值
+            # factor_values_by_factor[因子代码] = {ts_code: 因子值}
+            factor_values_by_factor = {fc.get("factor_code"): {} for fc in factors}
+
+            for ts_code in stocks:
+                # 优先从本地获取
+                factor_data = FactorData.query.filter_by(
+                    ts_code=ts_code,
+                    trade_date=trade_date
+                ).first()
+
+                if not factor_data:
+                    logger.debug(f"未找到{ts_code} {trade_date}的因子数据")
+                    continue
+
+                # 获取因子值
+                for fc in factors:
+                    factor_code = fc.get("factor_code")
+                    val = getattr(factor_data, factor_code, None)
+                    if val is not None:
+                        try:
+                            factor_values_by_factor[factor_code][ts_code] = float(val)
+                        except:
+                            pass
+
+            # 检查是否有任何因子数据
+            has_data = False
+            for factor_code in factor_values_by_factor:
+                if factor_values_by_factor[factor_code]:
+                    has_data = True
+                    break
+            if not has_data:
+                logger.debug("没有因子数据")
+                return {}
+
+            # Z-score标准化 + 加权求和
+            scores = {}
+            for ts_code in stocks:
+                # 收集该股票的所有因子值
+                factor_scores = {}
+                for fc in factors:
+                    factor_code = fc.get("factor_code")
+                    factor_dict = factor_values_by_factor.get(factor_code, {})
+                    if ts_code not in factor_dict:
+                        continue
+
+                    # 计算该因子在所有股票中的均值和标准差
+                    all_values = list(factor_dict.values())
+                    if len(all_values) < 2:
+                        continue
+
+                    mean_v = sum(all_values) / len(all_values)
+                    variance = sum((v - mean_v) ** 2 for v in all_values) / len(all_values)
+                    std_v = variance ** 0.5
+
+                    # 标准化该股票的因子值
+                    val = factor_dict[ts_code]
+                    z_score = (val - mean_v) / std_v if std_v > 0 else 0
+                    factor_scores[factor_code] = z_score
+
+                # 加权求和
+                total_score = 0
+                for fc in factors:
+                    factor_code = fc.get("factor_code")
+                    weight = fc.get("weight", 0)
+                    direction = fc.get("direction", "long")
+                    z_score = factor_scores.get(factor_code, 0)
+                    score = z_score * weight
+
+                    if direction == "short":
+                        score = -score
+
+                    total_score += score
+
+                if factor_scores:  # 只有至少有一个因子值才计算得分
+                    scores[ts_code] = total_score
+
+            return scores
+
+    def _select_stocks(self, scores: Dict[str, float], top_n: int) -> List[Dict]:
+        """根据得分选股"""
+        # 按得分排序，返回前top_n只
+        sorted_stocks = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        selected = []
+
+        for i, (ts_code, score) in enumerate(sorted_stocks[:top_n]):
+            selected.append({
+                "ts_code": ts_code,
+                "score": score,
+                "rank": i + 1
+            })
+
+        return selected
+
+    def _get_price(self, ts_code: str, trade_date: str) -> Optional[float]:
+        """获取收盘价（优先从本地数据库）"""
+        try:
+            # 优先从本地BarData表获取
+            bar = BarData.query.filter_by(
+                ts_code=ts_code,
+                trade_date=trade_date
+            ).first()
+
+            if bar and bar.close:
+                return float(bar.close)
+
+            logger.debug(f"从本地获取{ts_code} {trade_date}价格: {bar.close}")
+            return None
+        except Exception as e:
+            logger.debug(f"从本地获取价格失败: {e}")
+
+            return None
+
+    def _get_latest_record(self, strategy_id: int) -> Optional[DailyObserverRecord]:
+        """获取最新记录"""
+        return DailyObserverRecord.query.filter_by(
+            strategy_id=strategy_id
+        ).order_by(DailyObserverRecord.date.desc()).first()
+
+    def _get_trading_days(self, start_date: str, end_date: str) -> List[str]:
+        """生成交易日列表（简单过滤周末）"""
+        start = datetime.strptime(start_date, "%Y%m%d")
+        end = datetime.strptime(end_date, "%Y%m%d")
+        days = []
+        d = start
+        while d <= end:
+            if d.weekday() < 5:  # 周一到周五
+                days.append(d.strftime("%Y%m%d"))
+            d += timedelta(days=1)
+        return days
+
+    def _run_daily_observation(self, strategy_id: int, trade_date: str) -> Dict:
+        """执行单日观测"""
+        result = {
+            "date": trade_date,
+            "success": False,
+            "error": None,
+            "selected_stocks": [],
+            "trades": [],
+            "day_return": 0,
+            "total_value": 0
+        }
+
+        try:
+            # 获取策略
+            strategy = DailyObserverStrategy.query.get(strategy_id)
+            if not strategy:
+                result["error"] = "策略不存在"
+                return result
+
+            # 检查是否已处理
+            existing = self._get_latest_record(strategy_id)
+            if existing and existing.date == trade_date:
+                result["success"] = True
+                result["message"] = "今日已处理"
+                return result
+
+            # 获取股票池
+            stock_pool = self._get_stock_pool(strategy)
+            if not stock_pool:
+                result["error"] = "股票池为空"
+                return result
+
+            # 检查因子数据可用性
+            if not self._has_factor_data(stock_pool, trade_date):
+                logger.debug(f"跳过{trade_date}：因子数据不足")
+                result["error"] = "因子数据不足"
+                return result
+
+            # 计算得分
+            scores = self._calculate_scores(strategy, stock_pool, trade_date)
+            if not scores:
+                result["error"] = "无有效得分"
+                return result
+
+            # 选股
+            selected = self._select_stocks(scores, strategy.top_n)
+            result["selected_stocks"] = [s["ts_code"] for s in selected]
+
+            # 获取上一日记录
+            prev_record = DailyObserverRecord.query.filter(
+                DailyObserverRecord.strategy_id == strategy_id,
+                DailyObserverRecord.date < trade_date
+            ).order_by(DailyObserverRecord.date.desc()).first()
+
+            # 初始化资金和持仓
+            initial_capital = 1000000
+            if prev_record:
+                capital = float(prev_record.cash) if prev_record.cash else 1000000
+                holdings_dict = json.loads(prev_record.holdings) if prev_record.holdings else {}
+            else:
+                capital = float(initial_capital)
+                holdings_dict = {}
+
+            # 初始化交易列表
+            trades = []
+
+            # 固定最大持仓数
+            MAX_POSITIONS = strategy.max_positions
+
+            # ==================== 简单的买入逻辑 ====================
+            buy_count = len(holdings_dict)
+
+            # 只有持仓未满才能买入
+            if buy_count < MAX_POSITIONS:
+                # 计算可用资金（平均分配给每只股票）
+                available_capital = capital
+                buy_budget = available_capital / (MAX_POSITIONS - buy_count)
+
+                # 按排名依次买入
+                for stock_info in selected:
+                    ts_code = stock_info["ts_code"]
+
+                    # 跳过已在持仓的
+                    if ts_code in holdings_dict:
+                        logger.debug(f"{ts_code}已在持仓，跳过买入")
+                        continue
+
+                    # 获取价格
+                    price = self._get_price(ts_code, trade_date)
+                    if price is None:
+                        logger.warning(f"获取{ts_code}价格失败，跳过买入")
+                        continue
+
+                    # 计算买入数量
+                    # 假设：每只股票分配相同金额
+                    volume = int(buy_budget / price / 100)  # 取整百股
+
+                    if volume < 100:
+                        logger.warning(f"买入数量太少({volume})，跳过")
+                        continue
+
+                    # 计算金额
+                    amount = float(price * volume)
+                    commission = amount * COMMISSION_RATE
+
+                    # 记录买入
+                    trade = DailyObserverTrade(
+                        strategy_id=strategy_id,
+                        record_id=0,
+                        date=trade_date,
+                        ts_code=ts_code,
+                        direction="buy",
+                        price=price,
+                        volume=volume,
+                        amount=amount,
+                        commission=commission,
+                        signal_reason="因子选股",
+                        composite_score=stock_info["score"],
+                        rank=stock_info["rank"]
+                    )
+                    trades.append(trade)
+
+                    # 更新资金
+                    capital -= (amount + commission)
+
+                    # 添加持仓
+                    holdings_dict[ts_code] = {
+                        "buy_price": price,
+                        "buy_date": trade_date,
+                        "volume": volume,
+                        "score": stock_info["score"],
+                        "rank": stock_info["rank"]
+                    }
+
+                    buy_count += 1
+
+                    # 买满7只就停止
+                    if buy_count >= MAX_POSITIONS:
+                        break
+
+            # ==================== 简单的卖出逻辑 ====================
+            # 遍历所有持仓
+            for ts_code in list(holdings_dict.keys()):
+                try:
+                    price = self._get_price(ts_code, trade_date)
+                    if price is None:
+                        logger.warning(f"获取{ts_code}价格失败，跳过卖出")
+                        continue
+
+                    holding = holdings_dict[ts_code]
+
+                    # 计算收益率
+                    buy_price = float(holding["buy_price"])
+                    pct_chg = (price - buy_price) / buy_price if buy_price > 0 else 0
+
+                    should_sell = False
+                    sell_reason = ""
+
+                    # 1. 达到止盈/止损
+                    if pct_chg >= strategy.take_profit_ratio:
+                        should_sell = True
+                        sell_reason = "止盈"
+                    elif pct_chg <= strategy.stop_loss_ratio:
+                        should_sell = True
+                        sell_reason = "止损"
+
+                    # 2. 排名下降
+                    # 简化版：��名下降到阈值以外
+                    rank_now = None
+                    for s_info in selected:
+                        if s_info["ts_code"] == ts_code:
+                            rank_now = s_info["rank"]
+                            break
+                    if rank_now is None:
+                        rank_now = 999  # 不在前N名中，视为排名最低
+
+                    rank_prev = holding.get("rank", 999)
+                    # 只有当前排名低于之前排名（排名数值变大）才卖出
+                    if rank_now > rank_prev:
+                        should_sell = True
+                        sell_reason = "排名下降"
+
+                    if should_sell:
+                        volume = holding["volume"]
+
+                        # 计算金额
+                        amount = float(price * volume)
+                        commission = amount * COMMISSION_RATE
+
+                        # 记录卖出
+                        trade = DailyObserverTrade(
+                            strategy_id=strategy_id,
+                            record_id=0,
+                            date=trade_date,
+                            ts_code=ts_code,
+                            direction="sell",
+                            price=price,
+                            volume=volume,
+                            amount=amount,
+                            commission=commission,
+                            signal_reason=sell_reason,
+                            composite_score=holding.get("score", 0),
+                            rank=holding.get("rank", 0)
+                        )
+                        trades.append(trade)
+
+                        # 更新资金
+                        capital += (amount - commission)
+
+                        # 移除持仓
+                        del holdings_dict[ts_code]
+
+            # 计算持仓市值
+            position_value = 0
+            for ts_code, holding in holdings_dict.items():
+                price = self._get_price(ts_code, trade_date)
+                if price:
+                    position_value += price * holding["volume"]
+
+            total_value = capital + position_value
+
+            # 计算收益率
+            if prev_record:
+                prev_value = float(prev_record.total_value) if prev_record.total_value else initial_capital
+                day_return = (total_value - prev_value) / prev_value * 100 if prev_value > 0 else 0
+                cumulative_return = float(prev_record.cumulative_return or 0) + day_return
+
+            # 构建返回数据
+            result.update({
+                "selected_stocks": selected,
+                "day_return": day_return,
+                "cumulative_return": cumulative_return,
+                "total_value": total_value,
+                "capital": capital,
+                "position_value": position_value,
+                "cash": capital,
+                "holdings": json.dumps(holdings_dict),
+                "holding_count": len(holdings_dict)
+            })
+
+            # 创建观测记录
+            record = DailyObserverRecord(
+                strategy_id=strategy_id,
+                date=trade_date,
+                selected_stocks=json.dumps([s["ts_code"] for s in selected]),
+                scores=json.dumps(scores),
+                capital=capital,
+                position_value=position_value,
+                cash=capital,
+                day_return=day_return,
+                cumulative_return=cumulative_return,
+                total_value=total_value,
+                holdings=json.dumps(holdings_dict),
+                holding_count=len(holdings_dict)
+            )
+
+            db.session.add(record)
+            db.session.commit()
+
+            result["success"] = True
+            result["trades"] = trades
+
+        except Exception as e:
+            logger.error(f"执行观测失败: {e}")
+            result["error"] = str(e)
+
+        return result
+
+    def sync_strategy(self, strategy_id: int) -> Dict:
+        """同步单个策略（从上次运行日期到今天）"""
+        result = {
+            "strategy_id": strategy_id,
+            "synced": 0,
+            "errors": []
+        }
+
+        try:
+            strategy = DailyObserverStrategy.query.get(strategy_id)
+            if not strategy:
+                result["errors"].append("策略不存在")
+                return result
+
+            # 确定起始日期
+            start_date = strategy.last_run_date or "20240901"  # 从2024年9月开始
+
+            end_date = datetime.now().strftime("%Y%m%d")
+
+            # 获取股票池
+            stock_pool = self._get_stock_pool(strategy)
+
+            # 获取交易日列表
+            trading_days = self._get_trading_days(start_date, end_date)
+
+            # 执行每个交易日
+            for trade_date in trading_days:
+                # 跳过今天
+                today = datetime.now().strftime("%Y%m%d")
+                if trade_date == today:
+                    continue
+
+                # 跳过没有足够因子数据的日期
+                if not self._has_factor_data(stock_pool, trade_date):
+                    logger.debug(f"跳过{trade_date}：因子数据不足")
+                    continue
+
+                # 执行观测
+                r = self._run_daily_observation(strategy_id, trade_date)
+                if r["success"]:
+                    result["synced"] += 1
+                else:
+                    result["errors"].append(f"{trade_date}: {r.get('error')}")
+                    logger.info(f"策略{strategy_id} 同步完成: {result['synced']}天")
+
+            logger.info(f"策略{strategy_id}同步完成: {result['synced']}天，错误: {len(result['errors'])}")
+            return result
+
+    def sync_all_strategies(self) -> Dict:
+        """同步所有策略"""
+        result = {
+            "total": 0,
+            "synced": 0,
+            "errors": []
+        }
+
+        strategies = DailyObserverStrategy.query.filter_by(status="active").all()
+        result["total"] = len(strategies)
+
+        for strategy in strategies:
+            r = self.sync_strategy(strategy.id)
+            result["synced"] += r["synced"]
+            result["errors"].extend(r["errors"])
+
+        return result
+
+    def fill_missing_data(self) -> Dict:
+        """补齐缺失数据"""
+        result = {
+            "checked": 0,
+            "filled": 0,
+            "errors": []
+        }
+
+        try:
+            strategies = DailyObserverStrategy.query.filter_by(status="active").all()
+
+            for strategy in strategies:
+                # 确定起始日期
+                start_date = "20240901"  # 从2024年9月开始
+
+                # 获取交易日列表
+                trading_days = self._get_trading_days(start_date, datetime.now().strftime("%Y%m%d"))
+
+                # 执行每个交易日
+                for trade_date in trading_days:
+                    # 跳过今天
+                    today = datetime.now().strftime("%Y%m%d")
+                    if trade_date == today:
+                        continue
+
+                    # 跳过没有足够因子数据的日期
+                    if not self._has_factor_data(
+                        self._get_stock_pool(strategy), trade_date):
+                        logger.debug(f"跳过{trade_date}：因子数据不足")
+                        continue
+
+                    # 检查是否已处理
+                    existing = DailyObserverRecord.query.filter_by(
+                        strategy_id=strategy.id,
+                        date=trade_date
+                    ).first()
+
+                    if existing:
+                        continue
+
+                    # 执行观测
+                    r = self._run_daily_observation(strategy.id, trade_date)
+                    if r["success"]:
+                        result["filled"] += 1
+
+        except Exception as e:
+            result["errors"].append(str(e))
+            logger.error(f"补齐失败: {e}")
+
+        result["checked"] = len(trading_days)
+        logger.info(f"补齐完成: 检查{result['checked']}天，补齐{result['filled']}天")
+
+        return result
