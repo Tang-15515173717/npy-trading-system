@@ -8,9 +8,12 @@ from flask import Flask
 from flask_cors import CORS
 from flask_login import LoginManager
 import os
+from dotenv import load_dotenv
+
+# 加载环境变量
+load_dotenv()
 
 # 导入TuShare Token
-import os
 import sys
 # 添加项目根目录到路径
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -47,6 +50,7 @@ from api.scoring_api import scoring_bp  # v2.3 新增
 from api.signal_strategy_api import signal_strategy_bp  # v2.3 新增
 from api.daily_observer_api import daily_observer_bp  # v2.6 每日模拟观测
 from api.auth_api import auth_bp  # SaaS认证
+from api.payment_api import payment_bp  # 支付模块
 
 
 def create_app(config_name: str = "default") -> Flask:
@@ -81,6 +85,7 @@ def create_app(config_name: str = "default") -> Flask:
     app.register_blueprint(signal_strategy_bp)  # v2.3 信号策略
     app.register_blueprint(daily_observer_bp)  # v2.6 每日模拟观测
     app.register_blueprint(auth_bp)  # SaaS认证
+    app.register_blueprint(payment_bp)  # 支付模块
 
     @app.route("/health")
     def health():
