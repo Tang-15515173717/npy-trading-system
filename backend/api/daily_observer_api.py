@@ -35,6 +35,127 @@ logger = logging.getLogger(__name__)
 daily_observer_bp = Blueprint("daily_observer", __name__, url_prefix="/api/daily-observer")
 
 
+# ============================================================================
+# 合规改造 - 辅助函数
+# ============================================================================
+
+DISCLAIMER_TEMPLATE = """
+⚠️ 重要声明
+
+本系统提供的所有数据和分析结果，仅供研究学习使用，不构成任何投资建议。
+
+1. 历史表现不代表未来收益
+2. 因子筛选结果基于历史数据计算
+3. 投资有风险，决策需谨慎
+4. 用户应根据自身情况独立判断
+
+使用本系统即表示您已阅读并同意以上声明。
+"""
+
+
+def _simplify_signals(buy_signals: list, sell_signals: list = None) -> dict:
+    """
+    简化信号（合规改造）
+
+    改造要点：
+    1. ❌ 不输出：价格、数量、金额、买入建议
+    2. ✅ 只输出：代码、名称、得分、排名、因子分析
+    3. ✅ 必须加：免责声明
+
+    Args:
+        buy_signals: 买入信号列表
+        sell_signals: 卖出信号列表（可选）
+
+    Returns:
+        改造后的筛选结果
+    """
+    filter_results = []
+
+    # 处理买入信号 -> 筛选结果
+    for signal in buy_signals:
+        # 提取因子信息（如果有的话）
+        factors = []
+        reason_detail = signal.get("reason_detail", {})
+
+        # 如果有详细的因子分析
+        if "factor_analysis" in reason_detail:
+            for factor_name, factor_data in reason_detail["factor_analysis"].items():
+                factors.append({
+                    "name": factor_name,
+                    "value": str(factor_data.get("value", "N/A")),
+                    "signal": factor_data.get("signal", "中性"),
+                    "description": factor_data.get("description", "")
+                })
+        else:
+            # 如果没有详细因子分析，使用基础信息
+            factors.append({
+                "name": "综合得分",
+                "value": str(signal.get("score", 0)),
+                "signal": "强势" if signal.get("score", 0) >= 8 else "中性",
+                "description": f"排名第{signal.get('rank', 0)}"
+            })
+
+        # 构建筛选结果（去除敏感字段）
+        item = {
+            "ts_code": signal["ts_code"],
+            "name": signal["name"],
+            "score": signal.get("score", 0),
+            "rank": signal.get("rank", 0),
+            "factors": factors,
+            "summary": "因子得分较高，符合筛选条件"  # 改造后的文案
+        }
+
+        # ❌ 不包含：price, amount, volume, buy_price
+        # ❌ 不包含：建议买入、推荐买入
+
+        filter_results.append(item)
+
+    # 处理卖出信号 -> 不再符合条件
+    if sell_signals:
+        for signal in sell_signals:
+            item = {
+                "ts_code": signal["ts_code"],
+                "name": signal["name"],
+                "score": signal.get("score", 0),
+                "rank": signal.get("rank", 0),
+                "factors": [],
+                "summary": "不再符合筛选条件",  # 改造后的文案
+                "reason": signal.get("reason", "不再符合条件")
+            }
+            filter_results.append(item)
+
+    return {
+        "filter_results": filter_results,
+        "disclaimer": DISCLAIMER_TEMPLATE.strip()
+    }
+
+
+def _transform_text(text: str) -> str:
+    """
+    文案转换（合规改造）
+
+    转换规则：
+    - "买入信号" -> "筛选结果"
+    - "卖出信号" -> "不再符合条件"
+    - "建议买入" -> "符合筛选条件"
+    - "推荐买入" -> "因子得分较高"
+    """
+    text_mapping = {
+        "买入信号": "筛选结果",
+        "卖出信号": "不再符合条件",
+        "建议买入": "符合筛选条件",
+        "推荐买入": "因子得分较高",
+        "预期收益": "历史表现",
+        "目标价格": "参考点位",
+        "止损价格": "风险参考"
+    }
+
+    for old, new in text_mapping.items():
+        text = text.replace(old, new)
+
+    return text
+
+
 def _verify_strategy_ownership(strategy_id: int, tenant_id: int) -> DailyObserverStrategy:
     """
     验证策略所有权（租户隔离）
@@ -1533,3 +1654,78 @@ def save_recommendation(strategy_id: int):
         logger.error(f"记录推荐失败: {e}")
         return error(message=str(e))
 
+
+
+# ============================================================================
+# 合规改造接口 - 每日筛选结果（改造后）
+# ============================================================================
+
+@daily_observer_bp.route("/strategies/<int:strategy_id>/filter-results", methods=["GET"])
+@token_required
+@check_feature_limit("observer")  # 检查是否为专业版用户
+def get_filter_results_compliant(strategy_id: int):
+    """
+    获取策略的筛选结果（改造后合规版）
+    
+    合规改造要点：
+    1. ❌ 不输出：价格、数量、金额、买入建议
+    2. ✅ 只输出：代码、名称、得分、排名、因子分析
+    3. ✅ 必须加：免责声明
+    
+    文案改造：
+    - "买入信号" -> "筛选结果"
+    - "卖出信号" -> "不再符合条件"
+    - "建议买入" -> "符合筛选条件"
+    """
+    try:
+        tenant_id = get_current_tenant_id()
+        
+        # 验证策略所有权
+        strategy = _verify_strategy_ownership(strategy_id, tenant_id)
+        if not strategy:
+            return error(message="策略不存在或无权访问", code=404)
+        
+        # 调用原有的 action-plan 接口获取数据
+        from flask import current_app
+        with current_app.test_request_context():
+            # 复用 get_action_plan 的逻辑
+            result = get_action_plan(strategy_id)
+            
+            if result.status_code != 200:
+                return result
+            
+            # 解析返回的数据
+            data = result.get_json()
+            if data.get("code") != 0:
+                return result
+            
+            plan_data = data.get("data", {})
+            
+            # 使用简化函数处理信号
+            simplified = _simplify_signals(
+                buy_signals=plan_data.get("buy_signals", []),
+                sell_signals=plan_data.get("sell_signals", [])
+            )
+            
+            # 构建改造后的响应
+            return success(data={
+                "date": plan_data.get("date"),
+                "execution_date": plan_data.get("execution_date"),
+                "strategy_name": strategy.name,
+                "disclaimer": simplified["disclaimer"],
+                "filter_results": simplified["filter_results"],
+                "statistics": {
+                    "total_pool": len(plan_data.get("buy_signals", [])) + len(plan_data.get("sell_signals", [])) + len(plan_data.get("continue_holdings", [])),
+                    "qualified": len(plan_data.get("buy_signals", [])),
+                    "not_qualified": len(plan_data.get("sell_signals", [])),
+                    "holding": len(plan_data.get("continue_holdings", [])),
+                    "avg_score": sum(s.get("score", 0) for s in simplified["filter_results"]) / len(simplified["filter_results"]) if simplified["filter_results"] else 0
+                },
+                "generated_at": datetime.now().isoformat()
+            })
+            
+    except Exception as e:
+        logger.error(f"获取筛选结果失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return error(message=f"获取失败: {str(e)}")
