@@ -46,6 +46,7 @@ class DailyObserverStrategy(db.Model):
     sell_rank_out = db.Column(db.Integer, default=50, comment="排名跌出多少名则卖出")
     signal_confirm_days = db.Column(db.Integer, default=1, comment="信号确认天数")
     blacklist_cooldown = db.Column(db.Integer, default=30, comment="黑名单冷却天数")
+    rank_drop_threshold = db.Column(db.Integer, default=15, comment="排名下降超过N位则卖出")
     initial_capital = db.Column(db.Float, default=1000000.0, comment="初始资金")
 
     # 运行状态
@@ -77,6 +78,7 @@ class DailyObserverStrategy(db.Model):
             "sell_rank_out": self.sell_rank_out,
             "signal_confirm_days": self.signal_confirm_days,
             "blacklist_cooldown": self.blacklist_cooldown,
+            "rank_drop_threshold": self.rank_drop_threshold if self.rank_drop_threshold else 15,
             "initial_capital": self.initial_capital if self.initial_capital else 1000000.0,
             "status": self.status,
             "last_run_date": self.last_run_date,

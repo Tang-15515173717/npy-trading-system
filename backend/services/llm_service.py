@@ -35,12 +35,22 @@ class LLMService:
         self._api_key: str = ""
         self._base_url: str = ""
         self._model: str = ""
+        self._provider: str = ""
 
     def _load_config(self) -> None:
         """从 Flask app config 加载配置"""
-        self._api_key = current_app.config.get("DEEPSEEK_API_KEY", "")
-        self._base_url = current_app.config.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-        self._model = current_app.config.get("DEEPSEEK_MODEL", "deepseek-chat")
+        # 优先使用 Anthropic Claude
+        self._api_key = current_app.config.get("ANTHROPIC_API_KEY", "")
+        self._base_url = current_app.config.get("ANTHROPIC_BASE_URL", "https://www.claudecodeserver.top/api")
+        self._model = current_app.config.get("ANTHROPIC_MODEL", "claude-3-opus-20240229")
+        self._provider = "anthropic"
+
+        # 如果 Anthropic 未配置，回退到 DeepSeek
+        if not self._api_key:
+            self._api_key = current_app.config.get("DEEPSEEK_API_KEY", "")
+            self._base_url = current_app.config.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+            self._model = current_app.config.get("DEEPSEEK_MODEL", "deepseek-chat")
+            self._provider = "deepseek"
 
     def is_available(self) -> bool:
         """检查 LLM 服务是否可用（是否配置了 API Key）"""
@@ -63,7 +73,7 @@ class LLMService:
         self._load_config()
 
         if not self._api_key:
-            logger.warning("DeepSeek API Key 未配置，跳过 LLM 调用")
+            logger.warning(f"{self._provider} API Key 未配置，跳过 LLM 调用")
             return None
 
         url = f"{self._base_url}/v1/chat/completions"
@@ -87,23 +97,23 @@ class LLMService:
         }
 
         try:
-            logger.info(f"调用 DeepSeek API, model={self._model}, prompt长度={len(user_prompt)}")
+            logger.info(f"调用 {self._provider} API, model={self._model}, prompt长度={len(user_prompt)}")
             response = requests.post(url, headers=headers, json=payload, timeout=60)
             response.raise_for_status()
 
             data = response.json()
             content = data["choices"][0]["message"]["content"]
-            logger.info(f"DeepSeek 响应成功, 输出长度={len(content)}")
+            logger.info(f"{self._provider} 响应成功, 输出长度={len(content)}")
             return content
 
         except requests.exceptions.Timeout:
-            logger.error("DeepSeek API 调用超时")
+            logger.error(f"{self._provider} API 调用超时")
             return None
         except requests.exceptions.HTTPError as e:
-            logger.error(f"DeepSeek API HTTP错误: {e}, 响应: {e.response.text if e.response else 'N/A'}")
+            logger.error(f"{self._provider} API HTTP错误: {e}, 响应: {e.response.text if e.response else 'N/A'}")
             return None
         except Exception as e:
-            logger.error(f"DeepSeek API 调用异常: {e}")
+            logger.error(f"{self._provider} API 调用异常: {e}")
             return None
 
     def analyze_backtest(self, analysis_data: Dict[str, Any]) -> Optional[str]:

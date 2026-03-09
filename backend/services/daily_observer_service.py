@@ -87,6 +87,45 @@ class DailyObserverService:
             logger.debug(f"检查因子数据失败: {e}")
             return False
 
+    def _has_kline_data_for_date(self, stocks: List[str], trade_date: str, min_ratio: float = 0.3) -> bool:
+        """
+        检查指定日期的K线数据是否已准备好
+        
+        交易执行需要当天的价格数据（开盘价买入、收盘价计算市值）
+        如果当天K线数据不足，就不应该执行交易，避免产生异常数据
+        
+        Args:
+            stocks: 股票池
+            trade_date: 交易日期（YYYYMMDD格式）
+            min_ratio: 最小覆盖率（默认30%）
+            
+        Returns:
+            bool: 是否有足够的K线数据
+        """
+        from models.bar_data import BarData
+        
+        try:
+            if not stocks:
+                return False
+                
+            count = BarData.query.filter(
+                BarData.ts_code.in_(stocks),
+                BarData.trade_date == trade_date
+            ).count()
+            
+            ratio = count / len(stocks) if stocks else 0
+            has_enough = ratio >= min_ratio
+            
+            logger.debug(f"[K线检查] {trade_date}: {count}/{len(stocks)} = {ratio*100:.1f}% >= {min_ratio*100}%? {has_enough}")
+            
+            if not has_enough:
+                logger.warning(f"⚠️ {trade_date} K线数据不足: {count}/{len(stocks)} ({ratio*100:.1f}%)")
+            
+            return has_enough
+        except Exception as e:
+            logger.error(f"检查K线数据失败: {e}")
+            return False
+
     def _calculate_scores(self, strategy: DailyObserverStrategy, stocks: List[str],
                          trade_date: str) -> Dict[str, Dict]:
         """计算所有股票的因子得分（使用执行引擎）"""
@@ -94,6 +133,11 @@ class DailyObserverService:
 
         # 使用策略配置的执行引擎
         engine = get_engine(strategy.scoring_engine_id)
+        
+        # 🔴 对于 simple_conservative 引擎,需要设置因子组合ID并加载配置
+        if hasattr(engine, 'factor_combo_id') and hasattr(engine, '_load_factor_config'):
+            engine.factor_combo_id = strategy.factor_combo_id
+            engine._load_factor_config()
 
         # v2_adaptive引擎需要根据市场状态动态选择因子组合
         if hasattr(engine, '_detect_market_state'):
@@ -371,7 +415,14 @@ class DailyObserverService:
                 result["error"] = "股票池为空"
                 return result
 
-            # 🔴 T+1逻辑：获取前一个有数据的交易日
+            # 🔴 T+1逻辑：优先读取昨天生成的推荐记录
+            from models.daily_recommendation import DailyRecommendation
+            recommendation = DailyRecommendation.query.filter_by(
+                strategy_id=strategy_id,
+                execution_date=trade_date  # 查找execution_date=今天的推荐
+            ).first()
+            
+            # 🔴 T+1逻辑：获取前一个有数据的交易日(用于计算得分)
             signal_date = self._get_prev_trading_day(trade_date, stock_pool)
             
             if signal_date is None:
@@ -379,16 +430,36 @@ class DailyObserverService:
                 result["error"] = "前一交易日数据不足"
                 return result
 
+            # 🔴 新增：只对"今天"检查K线数据是否已准备好
+            today = datetime.now().strftime("%Y%m%d")
+            if trade_date == today:
+                if not self._has_kline_data_for_date(stock_pool, trade_date):
+                    logger.warning(f"⚠️ 跳过{trade_date}：今天的K线数据未准备好，请先下载")
+                    result["error"] = f"{trade_date}的K线数据未准备好"
+                    result["skip_reason"] = "kline_not_ready"
+                    return result
+
             # 🔴 使用前一个有数据的交易日来计算得分（生成今日要执行的信号）
             logger.info(f"📊 {trade_date}: 使用{signal_date}的数据生成交易信号")
             stock_scores = self._calculate_scores(strategy, stock_pool, signal_date)
+            
             if not stock_scores:
                 result["error"] = "无有效得分"
                 return result
-
+            
             # 选股
             selected = self._select_stocks(stock_scores, strategy.top_n)
             result["selected_stocks"] = [s["ts_code"] for s in selected]
+            
+            # 如果有推荐记录,使用推荐中的买卖信号
+            use_recommendation = recommendation is not None
+            if use_recommendation:
+                logger.info(f"📋 {trade_date}: 使用推荐记录(基于{recommendation.record_date}的数据)")
+                # 从推荐记录中解析买卖信号
+                recommendation_buy = json.loads(recommendation.buy_signals) if recommendation.buy_signals else []
+                recommendation_sell = json.loads(recommendation.sell_signals) if recommendation.sell_signals else []
+            else:
+                logger.warning(f"⚠️ {trade_date}: 没有推荐记录,重新计算交易信号")
 
             # 获取上一日记录
             prev_record = DailyObserverRecord.query.filter(
@@ -408,63 +479,96 @@ class DailyObserverService:
             # 初始化交易列表
             trades = []
 
-            # 使用执行引擎决策买卖
-            engine = get_engine(strategy.scoring_engine_id)
-            
-            # 🔴 根据引擎类型准备不同的参数（确保与回测逻辑一致）
-            engine_id = strategy.scoring_engine_id or "daily_observer"
-            if engine_id == "simple_conservative":
-                # simple_conservative 引擎使用自己的保守参数
-                strategy_params = {
-                    "min_score": 0.7,  # 得分阈值
-                    "max_positions": strategy.max_positions,
-                    "take_profit_ratio": 0.20,  # 20%止盈（与回测一致）
-                    "stop_loss_ratio": -0.05,   # 5%止损（与回测一致）
-                    "hold_min_days": 5,          # 最少持有5天
-                    "blacklist_cooldown": strategy.blacklist_cooldown
-                }
+            # 🔴 如果使用推荐记录,直接转换为decisions格式
+            if use_recommendation:
+                # 从推荐记录构建decisions
+                decisions = {"buy": [], "sell": []}
+                
+                # 处理卖出信号
+                for sell_signal in recommendation_sell:
+                    ts_code = sell_signal.get("ts_code")
+                    if ts_code in holdings_dict:
+                        decisions["sell"].append({
+                            "ts_code": ts_code,
+                            "price": self._get_price(ts_code, trade_date) or sell_signal.get("price", 0),
+                            "volume": holdings_dict[ts_code].get("volume", 0),
+                            "reason": sell_signal.get("reason", "推荐卖出")
+                        })
+                
+                # 处理买入信号
+                for buy_signal in recommendation_buy:
+                    decisions["buy"].append({
+                        "ts_code": buy_signal.get("ts_code"),
+                        "price": self._get_price(buy_signal.get("ts_code"), trade_date) or buy_signal.get("price", 0),
+                        "volume": buy_signal.get("volume", 0),
+                        "score": buy_signal.get("score", 0),
+                        "rank": buy_signal.get("rank", 0),
+                        "reason": buy_signal.get("reason", "推荐买入")
+                    })
+                
+                logger.info(f"✅ 使用推荐: 买入{len(decisions['buy'])}只, 卖出{len(decisions['sell'])}只")
             else:
-                # 其他引擎使用策略配置的参数
-                strategy_params = {
-                    "max_positions": strategy.max_positions,
-                    "take_profit_ratio": strategy.take_profit_ratio,
-                    "stop_loss_ratio": strategy.stop_loss_ratio,
-                    "top_n": strategy.top_n,
-                    "sell_rank_out": strategy.sell_rank_out,
-                    "signal_confirm_days": strategy.signal_confirm_days,
-                    "blacklist_cooldown": strategy.blacklist_cooldown
-                }
-            
-            # 🔴 从数据库加载卖出历史（冷却期检查）
-            cooldown_days = strategy.blacklist_cooldown
-            cooldown_start_date = (datetime.strptime(trade_date, "%Y%m%d") - timedelta(days=cooldown_days)).strftime("%Y%m%d")
-            recent_sells = DailyObserverTrade.query.filter(
-                DailyObserverTrade.strategy_id == strategy_id,
-                DailyObserverTrade.direction == "sell",
-                DailyObserverTrade.date >= cooldown_start_date,
-                DailyObserverTrade.date < trade_date  # 不包括当天
-            ).all()
-            engine._sell_history = {trade.ts_code: trade.date for trade in recent_sells}
-            
-            # 🔴 加载亏损计数（用于simple_conservative引擎）
-            if hasattr(engine, 'stock_loss_count'):
-                from collections import defaultdict
-                engine.stock_loss_count = defaultdict(int)
-                # 统计历史亏损次数
-                loss_sells = DailyObserverTrade.query.filter(
+                # 没有推荐记录,使用引擎重新计算
+                # 使用执行引擎决策买卖
+                engine = get_engine(strategy.scoring_engine_id)
+                
+                # 🔴 根据引擎类型准备不同的参数（确保与回测逻辑一致）
+                engine_id = strategy.scoring_engine_id or "daily_observer"
+                if engine_id == "simple_conservative":
+                    # simple_conservative 引擎使用自己的保守参数
+                    strategy_params = {
+                        "min_score": 0.7,  # 得分阈值
+                        "max_positions": strategy.max_positions,
+                        "take_profit_ratio": 0.20,  # 20%止盈（与回测一致）
+                        "stop_loss_ratio": -0.05,   # 5%止损（与回测一致）
+                        "hold_min_days": 5,          # 最少持有5天
+                        "blacklist_cooldown": strategy.blacklist_cooldown
+                    }
+                else:
+                    # 其他引擎使用策略配置的参数
+                    strategy_params = {
+                        "max_positions": strategy.max_positions,
+                        "take_profit_ratio": strategy.take_profit_ratio,
+                        "stop_loss_ratio": strategy.stop_loss_ratio,
+                        "top_n": strategy.top_n,
+                        "sell_rank_out": strategy.sell_rank_out,
+                        "signal_confirm_days": strategy.signal_confirm_days,
+                        "blacklist_cooldown": strategy.blacklist_cooldown,
+                        "rank_drop_threshold": strategy.rank_drop_threshold or 15  # 从数据库读取，默认15
+                    }
+                
+                # 🔴 从数据库加载卖出历史（冷却期检查）
+                cooldown_days = strategy.blacklist_cooldown
+                cooldown_start_date = (datetime.strptime(trade_date, "%Y%m%d") - timedelta(days=cooldown_days)).strftime("%Y%m%d")
+                recent_sells = DailyObserverTrade.query.filter(
                     DailyObserverTrade.strategy_id == strategy_id,
                     DailyObserverTrade.direction == "sell",
-                    DailyObserverTrade.signal_reason.like("%止损%")
+                    DailyObserverTrade.date >= cooldown_start_date,
+                    DailyObserverTrade.date < trade_date  # 不包括当天
                 ).all()
-                for trade in loss_sells:
-                    engine.stock_loss_count[trade.ts_code] += 1
+                engine._sell_history = {trade.ts_code: trade.date for trade in recent_sells}
+                
+                # 🔴 加载亏损计数（用于simple_conservative引擎）
+                if hasattr(engine, 'stock_loss_count'):
+                    from collections import defaultdict
+                    engine.stock_loss_count = defaultdict(int)
+                    # 统计历史亏损次数
+                    loss_sells = DailyObserverTrade.query.filter(
+                        DailyObserverTrade.strategy_id == strategy_id,
+                        DailyObserverTrade.direction == "sell",
+                        DailyObserverTrade.signal_reason.like("%止损%")
+                    ).all()
+                    for trade in loss_sells:
+                        engine.stock_loss_count[trade.ts_code] += 1
 
-            decisions = engine.decide_daily_trades(
-                holdings=holdings_dict,
-                stock_scores=stock_scores,
-                strategy_params=strategy_params,
-                trade_date=trade_date
-            )
+                decisions = engine.decide_daily_trades(
+                    holdings=holdings_dict,
+                    stock_scores=stock_scores,
+                    strategy_params=strategy_params,
+                    trade_date=trade_date
+                )
+                
+                logger.info(f"⚠️ 重新计算: 买入{len(decisions['buy'])}只, 卖出{len(decisions['sell'])}只")
 
             # 🔴 修改：先执行卖出决策（与回测逻辑保持一致）
             # 🔴 修改：先执行卖出决策（与回测逻辑保持一致）
@@ -500,7 +604,13 @@ class DailyObserverService:
                 del holdings_dict[ts_code]
 
             # 🔴 然后执行买入决策（使用卖出后的资金）
-            buy_budget = capital / max(1, strategy.max_positions - len(holdings_dict))
+            # 🔴 修复：考虑手续费，预留1.5倍的手续费空间确保资金充足
+            available_capital = capital
+            positions_after_sell = strategy.max_positions - len(holdings_dict)
+            # 预留手续费空间：买入时需要支付手续费，所以预算要预留出来
+            # 公式：实际可用资金 = 当前资金 / (1 + 手续费率)，大约预留0.1%的空间
+            effective_capital = available_capital * (1 - COMMISSION_RATE * 1.5)
+            buy_budget = effective_capital / max(1, positions_after_sell)
             for buy_signal in decisions["buy"]:
                 ts_code = buy_signal["ts_code"]
                 price = buy_signal["price"]
@@ -619,6 +729,22 @@ class DailyObserverService:
 
             result["success"] = True
             result["trades"] = trades
+            
+            # 🔴 执行完交易后,立即生成明日推荐
+            try:
+                from services.recommendation_service import record_recommendation
+                rec_result = record_recommendation(strategy_id, target_date=trade_date)
+                if rec_result.get("success"):
+                    logger.info(f"✅ {trade_date}交易完成,已生成明日推荐: {rec_result.get('message')}")
+                    result["recommendation_saved"] = True
+                else:
+                    logger.warning(f"⚠️ 生成明日推荐失败: {rec_result.get('message')}")
+                    result["recommendation_saved"] = False
+            except Exception as rec_e:
+                logger.error(f"生成明日推荐异常: {rec_e}")
+                import traceback
+                traceback.print_exc()
+                result["recommendation_error"] = str(rec_e)
 
         except Exception as e:
             logger.error(f"执行观测失败: {e}")
@@ -653,7 +779,10 @@ class DailyObserverService:
             start_date = strategy.start_date or "20250901"
             logger.info(f"策略{strategy_id}: 起始日期={start_date}")
 
+            # 🔥 结束日期改为昨天，不尝试补全今天的数据（今天还没收盘）
+            from datetime import timedelta
             end_date = datetime.now().strftime("%Y%m%d")
+            logger.info(f"同步结束日期: {end_date}（不包含今天，避免因今天无数据导致失败）")
 
             # 获取股票池
             stock_pool = self._get_stock_pool(strategy)
@@ -745,6 +874,17 @@ class DailyObserverService:
                 if r["success"]:
                     result["synced"] += 1
                     processed_count += 1
+                elif r.get("skip_reason") == "kline_not_ready":
+                    # 🆕 K线数据未准备好，跳过但不计入错误
+                    skipped_count += 1
+                    logger.info(f"⏭️ 跳过{trade_date}：K线数据未准备好")
+                    # 添加到结果中，让前端知道跳过原因
+                    if "skipped_dates" not in result:
+                        result["skipped_dates"] = []
+                    result["skipped_dates"].append({
+                        "date": trade_date,
+                        "reason": "K线数据未准备好"
+                    })
                 else:
                     result["errors"].append(f"{trade_date}: {r.get('error')}")
                     logger.info(f"策略{strategy_id} 同步完成: {result['synced']}天")

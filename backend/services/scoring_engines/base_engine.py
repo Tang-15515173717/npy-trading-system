@@ -268,8 +268,8 @@ class BaseEngine:
             else:
                 current_rank = stock_scores[ts_code].get("rank", 999)
                 previous_rank = holding.get("rank", 999)
-                # 排名下降超过N位才卖出（降低敏感度）
-                rank_threshold = 10  # 排名下降超过10位才卖出
+                # 排名下降超过N位才卖出（可配置参数）
+                rank_threshold = strategy_params.get("rank_drop_threshold", 10)
                 if current_rank > previous_rank + rank_threshold:
                     should_sell = True
                     reason = f"排名下降({previous_rank}->{current_rank})"

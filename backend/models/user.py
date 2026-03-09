@@ -17,7 +17,6 @@ class Tenant(db.Model):
     plan = db.Column(db.String(20), default="basic", comment="套餐: basic/pro/enterprise")
     max_strategies = db.Column(db.Integer, default=5, comment="最大策略数")
     max_backtests_per_day = db.Column(db.Integer, default=10, comment="每日最大回测次数")
-    max_observers = db.Column(db.Integer, default=2, comment="最大观测数")
     is_active = db.Column(db.Boolean, default=True, comment="是否激活")
     
     # 🆕 试用和过期管理

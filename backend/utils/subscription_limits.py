@@ -3,7 +3,7 @@
 用于检查租户的套餐限制
 """
 from datetime import datetime, date
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 from models.user import Tenant
 from models.strategy import Strategy
 from models.backtest import BacktestTask
@@ -22,7 +22,7 @@ def get_plan_limits(plan: str) -> Dict:
     return get_plan_info(plan)
 
 
-def can_create_strategy(tenant_id: int) -> tuple[bool, str]:
+def can_create_strategy(tenant_id: int) -> Tuple[bool, str]:
     """
     检查是否可以创建新策略
     
@@ -56,7 +56,7 @@ def can_create_strategy(tenant_id: int) -> tuple[bool, str]:
     return True, ""
 
 
-def can_run_backtest(tenant_id: int) -> tuple[bool, str]:
+def can_run_backtest(tenant_id: int) -> Tuple[bool, str]:
     """
     检查是否可以运行回测（每日限制）
     
@@ -94,7 +94,7 @@ def can_run_backtest(tenant_id: int) -> tuple[bool, str]:
     return True, ""
 
 
-def can_create_observer(tenant_id: int) -> tuple[bool, str]:
+def can_create_observer(tenant_id: int) -> Tuple[bool, str]:
     """
     检查是否可以创建新观测
 
@@ -110,24 +110,19 @@ def can_create_observer(tenant_id: int) -> tuple[bool, str]:
     if not tenant.is_active:
         return False, "租户已禁用"
 
-    # 🆕 检查是否过期
-    status = tenant.get_status()
-    if status in ['trial_expired', 'expired']:
-        if status == 'trial_expired':
-            return False, "试用期已结束，请升级套餐"
-        return False, "套餐已过期，请续费"
-
-    # 获取当前观测策略数量
+    # 获取当前活跃观测数量
     current_count = DailyObserverStrategy.query.filter_by(
-        tenant_id=tenant_id
+        tenant_id=tenant_id,
+        status='active'
     ).count()
-
-    # 获取套餐限制（优先使用数据库中的值）
-    max_observers = tenant.max_observers if tenant.max_observers else get_plan_limits(tenant.plan)['max_observers']
-
+    
+    # 获取套餐限制
+    limits = get_plan_limits(tenant.plan)
+    max_observers = limits['max_observers']
+    
     if current_count >= max_observers:
         return False, f"已达到观测数量上限（{max_observers}个），请升级套餐"
-
+    
     return True, ""
 
 
@@ -155,37 +150,33 @@ def get_usage_stats(tenant_id: int) -> Dict:
     try:
         from models.daily_observer import DailyObserverStrategy
         observer_count = DailyObserverStrategy.query.filter_by(
-            tenant_id=tenant_id
+            tenant_id=tenant_id,
+            status='active'
         ).count()
     except:
         observer_count = 0
     
-    # 获取套餐限制（优先使用数据库中的值）
+    # 获取套餐限制
     limits = get_plan_limits(tenant.plan)
-
-    # 如果租户有自定义限制，使用租户的值
-    max_observers = tenant.max_observers if tenant.max_observers else limits['max_observers']
-    max_strategies = tenant.max_strategies if tenant.max_strategies else limits['max_strategies']
-    max_backtests = tenant.max_backtests_per_day if tenant.max_backtests_per_day else limits['max_backtests_per_day']
-
+    
     return {
         'plan': tenant.plan,
         'plan_name': limits['name'],
         'plan_price': limits['price'],
         'strategy': {
             'current': strategy_count,
-            'limit': max_strategies,
-            'percentage': round(strategy_count / max_strategies * 100, 1) if max_strategies > 0 and max_strategies < 9999 else 0
+            'limit': limits['max_strategies'],
+            'percentage': round(strategy_count / limits['max_strategies'] * 100, 1) if limits['max_strategies'] > 0 else 0
         },
         'backtest': {
             'today': today_backtest_count,
-            'daily_limit': max_backtests,
-            'percentage': round(today_backtest_count / max_backtests * 100, 1) if max_backtests > 0 else 0
+            'daily_limit': limits['max_backtests_per_day'],
+            'percentage': round(today_backtest_count / limits['max_backtests_per_day'] * 100, 1) if limits['max_backtests_per_day'] > 0 else 0
         },
         'observer': {
             'current': observer_count,
-            'limit': max_observers,
-            'percentage': round(observer_count / max_observers * 100, 1) if max_observers > 0 and max_observers < 9999 else 0
+            'limit': limits['max_observers'],
+            'percentage': round(observer_count / limits['max_observers'] * 100, 1) if limits['max_observers'] > 0 else 0
         },
         'tenant': {
             'is_active': tenant.is_active,
@@ -194,7 +185,7 @@ def get_usage_stats(tenant_id: int) -> Dict:
     }
 
 
-def get_all_plans() -> list[Dict]:
+def get_all_plans() -> List[Dict]:
     """
     获取所有套餐信息
     

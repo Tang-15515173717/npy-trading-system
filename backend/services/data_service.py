@@ -273,8 +273,31 @@ class DataService:
         )
         
         if df is None or len(df) == 0:
-            logger.warning(f"⚠️ 批量获取无数据，尝试逐只获取")
-            # 回退到逐只获取（兼容旧逻辑）
+            # 批量获取无数据，可能是：
+            # 1. 确实没数据（新股票）
+            # 2. 数据已有（增量下载）
+            # 先检查数据库是否已有数据，再决定是否回退
+            logger.info(f"⚠️ 批量获取无数据，检查是否需要下载")
+            has_existing = any([
+                db.session.query(BarData).filter(
+                    BarData.ts_code == code,
+                    BarData.trade_date >= start_date,
+                    BarData.trade_date <= (end_date or datetime.now().strftime("%Y%m%d"))
+                ).first()
+                for code in ts_codes
+            ])
+            if has_existing:
+                logger.info(f"✅ 数据库已有数据，无需下载")
+                return {
+                    "success_count": len(ts_codes),
+                    "fail_count": 0,
+                    "total": len(ts_codes),
+                    "failed_stocks": [],
+                    "stored_records": 0,
+                    "data_source": "TuShare API (existing)",
+                    "incremental": True,
+                }
+            logger.warning(f"⚠️ 批量获取无数据丽数据库无记录，尝试逐只获取")
             return self._download_with_tushare_single(ts_codes, start_date, end_date, freq)
         
         logger.info(f"✅ 批量获取到 {len(df)} 条数据")
@@ -379,6 +402,11 @@ class DataService:
         
         for idx, ts_code in enumerate(ts_codes, 1):
             try:
+                # 🔥 限流处理：每秒1次，避免超过TuShare每分钟50次的限制
+                if idx > 1:
+                    import time
+                    time.sleep(1.2)  # 每次间隔1.2秒，确保不超过50次/分钟
+                
                 df = self.ts_helper.get_daily_data(ts_code, start_date, end_date)
                 
                 if df is None or len(df) == 0:

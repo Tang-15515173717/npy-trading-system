@@ -310,6 +310,7 @@ def create_strategy():
             sell_rank_out=data.get("sell_rank_out", 50),
             signal_confirm_days=data.get("signal_confirm_days", 1),
             blacklist_cooldown=data.get("blacklist_cooldown", 30),
+            rank_drop_threshold=data.get("rank_drop_threshold", 15),
             status="active"
         )
 
@@ -1245,24 +1246,14 @@ def get_action_plan(strategy_id: int):
         engine_id = strategy.scoring_engine_id or "daily_observer"
         logger.info(f"📊 策略 {strategy_id} 使用引擎: {engine_id}")
         
+        # 使用统一的引擎获取方法
+        from services.scoring_engines.registry import get_engine
+        engine = get_engine(engine_id)
+        
+        # 🔴 对于 simple_conservative 引擎,需要设置因子组合ID并加载配置
         if engine_id == "simple_conservative":
-            from services.scoring_engines.simple_conservative import SimpleConservativeEngine
-            engine = SimpleConservativeEngine(factor_combo_id=strategy.factor_combo_id)
-        elif engine_id == "v2_adaptive":
-            from services.scoring_engines.v2_adaptive import V2AdaptiveEngine
-            engine = V2AdaptiveEngine()
-        elif engine_id == "v3_enhanced":
-            from services.scoring_engines.v3_enhanced import V3EnhancedEngine
-            engine = V3EnhancedEngine()
-        elif engine_id == "v4_optimized":
-            from services.scoring_engines.v4_optimized import V4OptimizedEngine
-            engine = V4OptimizedEngine()
-        elif engine_id == "v1_momentum":
-            from services.scoring_engines.v1_momentum import V1MomentumEngine
-            engine = V1MomentumEngine()
-        else:
-            from services.scoring_engines.daily_observer_engine import DailyObserverEngine
-            engine = DailyObserverEngine()
+            engine.factor_combo_id = strategy.factor_combo_id
+            engine._load_factor_config()
 
         # 准备引擎参数（根据引擎类型使用不同默认值）
         if engine_id == "simple_conservative":

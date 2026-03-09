@@ -33,6 +33,11 @@ class Config:
     DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
     DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
+    # Anthropic Claude LLM
+    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_AUTH_TOKEN", "")
+    ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL", "https://www.claudecodeserver.top/api")
+    ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-opus-20240229")
+
     # 数据与日志路径（项目根下）
     DATA_DIR = PROJECT_ROOT / "data"
     STOCKS_DATA_DIR = DATA_DIR / "stocks"

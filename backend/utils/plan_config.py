@@ -16,12 +16,12 @@ PLAN_LIMITS: Dict[str, Dict[str, Any]] = {
     'basic': {
         'name': '基础版',
         'price': 19,
-        'max_strategies': 9999,  # 不限制策略数量
+        'max_strategies': 5,
         'max_backtests_per_day': 10,
         'max_observers': 2,
         'data_retention_days': 90,  # 数据保留90天
         'features': [
-            '无限策略',
+            '5个策略',
             '每日10次回测',
             '2个观测策略',
             '90天数据',
